@@ -30,6 +30,33 @@ def get_weather(city: str):
         "condition": "sunny"
     }
 
+# Mock order data for learning purposes only.
+MOCK_ORDERS = {
+    "A123": {
+        "order_id": "A123",
+        "status": "Shipped",
+        "estimated_delivery": "2026-10-29",
+    },
+    "B456": {
+        "order_id": "B456",
+        "status": "Processing",
+        "estimated_delivery": None,
+    },
+}
+
+def get_order_status(order_id: str):
+    order = MOCK_ORDERS.get(order_id)
+    if order is None:
+        return {
+            "order_id": order_id,
+            "message": "No order is found with the provided order ID.",
+            "found": False
+        }
+    else:
+        return { "found": True, **order }
+
+
+
 # ---- 2. Describe the function to the model (the tool definition) ----
 tools = [
     {
@@ -48,12 +75,29 @@ tools = [
                 "required": ["city"]
             },
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_order_status",
+            "description": "Get the status of an order by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "The ID of the order to check"
+                    }
+                },
+                "required": ["order_id"]
+            },
+        }
     }
 ]
 
 
 # ---- 3. Step 1 - Send the question and tools to the model ----
-input_messages = [{"role": "user", "content": "What is the current weather in new york?"}]
+input_messages = [{"role": "user", "content": "Can you check order A123 and tell me its status and estimated delivery?"}]
 
 result = client.chat.completions.create(
     model="nvidia/nemotron-3.5-lightning-30b-a3b",
@@ -68,12 +112,15 @@ assistant_message = result.choices[0].message
 input_messages.append(assistant_message.model_dump(exclude_none=True))
 
 for tool_call in assistant_message.tool_calls or []:
-    # import pdb; pdb.set_trace()
-    if tool_call.function.name != "get_weather":
+    if tool_call.function.name == "get_order_status":
+        function_args = json.loads(tool_call.function.arguments)
+        function_result = get_order_status(function_args["order_id"])
+    elif tool_call.function.name == "get_weather":
+        function_args = json.loads(tool_call.function.arguments)
+        function_result = get_weather(function_args["city"])
+    else:
         raise ValueError(f"Unknown tool requested: {tool_call.function.name}")
 
-    function_args = json.loads(tool_call.function.arguments)
-    function_result = get_weather(function_args["city"])
     input_messages.append({
         "role": "tool",
         "tool_call_id": tool_call.id,
