@@ -68,6 +68,7 @@ development. CORS requires explicit origins; wildcards are rejected.
 ## Endpoints
 
 - `GET /health` — service health (does not contact the provider).
+- `POST /v1/dummy` — fixed JSON response for API testing.
 - `GET /v1/models` — the configured model allowlist used by the UI.
 - `GET /v1/mock-db` — list all in-memory mock database entries; pass `?key=...`
   to read a single entry.

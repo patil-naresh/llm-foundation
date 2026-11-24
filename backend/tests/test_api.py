@@ -80,6 +80,16 @@ async def test_health_and_model_allowlist(client):
 
 
 @pytest.mark.asyncio
+async def test_dummy_api_returns_the_same_fixed_body(client):
+    first_response = await client.post("/v1/dummy")
+    second_response = await client.post("/v1/dummy")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert second_response.json() == first_response.json()
+
+
+@pytest.mark.asyncio
 async def test_cors_allows_demo_user_id_header(client):
     response = await client.options(
         "/v1/chat/completions",

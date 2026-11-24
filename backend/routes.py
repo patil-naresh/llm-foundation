@@ -4,6 +4,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from mcp_client import execute_mcp_tool
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
@@ -29,11 +30,37 @@ async def health():
     return {"status": "ok"}
 
 
+@api.post("/v1/dummy")
+async def dummy(request: Request):
+    """
+    A dummy endpoint to test POST requests to the backend.
+    """
+    try:
+        return {"status": "ok", "backend_health": health}
+    except Exception as e:
+        logger.error("dummy_endpoint_failed error_type=%s", type(e).__name__)
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
 @api.get("/v1/models")
 async def list_models(request: Request):
     models = request.app.state.config_values["MODEL_ALLOWLIST"]
     return {"object": "list", "data": [{"id": model, "object": "model"} for model in models]}
 
+
+@api.get("/v1/health")
+async def backend_health(request: Request):
+    """
+    Check the health of the backend service.
+
+    Returns a JSON response indicating the health status.
+    """
+    try:
+        health = await client_for_model(request, request.app.state.config_values["DEFAULT_MODEL"]).health.check()
+        return {"status": "ok", "backend_health": health}
+    except Exception as e:
+        logger.error("backend_health_check_failed error_type=%s", type(e).__name__)
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=503)
 
 @api.post("/v1/approvals/{approval_id}")
 async def decide_approval(
@@ -134,17 +161,21 @@ async def basic_chat(payload: ChatRequest, request: Request):
         "usage": usage,
     }
 
+
+
 @api.post("/v1/chat/completions")
 async def chat_completions(payload: ChatCompletionRequest, request: Request):
     config = request.app.state.config_values
     model = payload.model or config["DEFAULT_MODEL"]
     if model not in config["MODEL_ALLOWLIST"]:
         return JSONResponse({"error": "Unknown model"}, status_code=400)
+
+    available_tools = TOOLS + request.app.state.mcp_tools
     options: dict[str, Any] = {
         "model": model,
         "messages": [message.model_dump() for message in payload.messages],
         "stream": False,
-        "tools": TOOLS,
+        "tools": available_tools,
     }
     if payload.temperature is not None:
         options["temperature"] = payload.temperature
@@ -157,6 +188,7 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
         result = await client.chat.completions.create(**options)
         messages = options["messages"]
         tool_results: list[dict[str, Any]] = []
+        mcp_mapping = request.app.state.mcp_tool_mapping
         for _ in range(5):
             if not result.choices:
                 return _chat_provider_shape_error(request)
@@ -167,25 +199,72 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
             if len(tool_calls) > 10:
                 return _chat_provider_shape_error(request)
             messages.append(assistant_message.model_dump(exclude_none=True))
-            try:
-                tool_messages, executions = map_tool_calls(
-                    tool_calls,
-                    request.app.state.mock_database,
-                    request.headers.get("X-Demo-User-ID"),
-                    request.app.state.pending_approvals,
-                )
-            except MissingDemoUserIdentity:
-                return JSONResponse(
-                    {
-                        "error": "A valid demo user ID is required for this tool.",
-                        "request_id": request.state.request_id,
-                    },
-                    status_code=401,
-                )
-            except InvalidToolCall:
-                return _chat_provider_shape_error(request)
-            messages.extend(tool_messages)
-            tool_results.extend(executions)
+            local_tool_calls = []
+            mcp_tool_calls = []
+            tool_messages = []
+            executions = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+
+                if tool_name in mcp_mapping:
+                    mcp_tool_calls.append(tool_call)
+                else:
+                    local_tool_calls.append(tool_call)
+            if local_tool_calls:
+                try:
+                    local_messages, local_executions = map_tool_calls(
+                        local_tool_calls,
+                        request.app.state.mock_database,
+                        request.headers.get("X-Demo-User-ID"),
+                        request.app.state.pending_approvals,
+                    )
+
+                    tool_messages.extend(local_messages)
+                    executions.extend(local_executions)
+                except MissingDemoUserIdentity:
+                    return JSONResponse(
+                        {
+                            "error": "A valid demo user ID is required for this tool.",
+                            "request_id": request.state.request_id,
+                        },
+                        status_code=401,
+                    )
+                except InvalidToolCall:
+                    return _chat_provider_shape_error(request)
+               
+            for tool_call in mcp_tool_calls:
+                openai_tool_name = tool_call.function.name
+                # Get original MCP tool name.
+                mcp_tool_name = mcp_mapping[openai_tool_name]
+                try:
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                    mcp_result = await execute_mcp_tool(request.app.state.mcp_session, mcp_tool_name, arguments)
+
+                    tool_content = json.dumps(mcp_result, default=str)
+
+                    executions.append({
+                        "tool": openai_tool_name,
+                        "result": mcp_result,
+                    })
+
+                except Exception:
+                    logger.exception(
+                        "mcp_tool_execution_failed tool=%s request_id=%s",
+                        mcp_tool_name,
+                        request.state.request_id,
+                    )
+
+                    tool_content = json.dumps({
+                        "error": "MCP tool execution failed"
+                    })
+
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_content,
+                })
+                messages.extend(tool_messages)
+                tool_results.extend(executions)            
             result = await client.chat.completions.create(**{**options, "messages": messages})
         else:
             if result.choices and result.choices[0].message.tool_calls:

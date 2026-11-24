@@ -18,6 +18,7 @@ from mock_database import mock_db_api
 from routes import api
 from settings import configure_app, positive
 from structured_outputs import structured_api
+from mcp_client import create_mcp_client, convert_mcp_tools_to_openai
 
 logger = logging.getLogger("llm_api")
 
@@ -156,27 +157,41 @@ def create_app(config=None, openai_client=None):
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    provider_clients = application.state.provider_clients
-    owns_clients = not provider_clients
-    try:
-        if owns_clients:
-            config = application.state.config_values
-            connect_timeout, read_timeout = config["UPSTREAM_TIMEOUT"]
-            for provider, provider_config in config["PROVIDER_SETTINGS"].items():
-                if not provider_config["api_key"]:
-                    key_name = "PROVIDER_API_KEY" if provider == "DEFAULT" else f"{provider}_API_KEY"
-                    raise ValueError(f"Set {key_name} in the backend environment")
-                provider_clients[provider] = AsyncOpenAI(
-                    api_key=provider_config["api_key"],
-                    base_url=provider_config["base_url"],
-                    timeout=httpx.Timeout(timeout=read_timeout, connect=connect_timeout),
-                    max_retries=1,
-                )
-        yield
-    finally:
-        if owns_clients:
-            for client in provider_clients.values():
-                await client.close()
+    async with create_mcp_client() as session:
+        # Discover available MCP tools.
+        result = await session.list_tools()
+
+        # Convert MCP tools into OpenAI-compatible definitions.
+        openai_tools, tool_mapping = (
+            convert_mcp_tools_to_openai(result.tools)
+        )
+        provider_clients = application.state.provider_clients
+        owns_clients = not provider_clients
+        try:
+            if owns_clients:
+                config = application.state.config_values
+                connect_timeout, read_timeout = config["UPSTREAM_TIMEOUT"]
+                for provider, provider_config in config["PROVIDER_SETTINGS"].items():
+                    if not provider_config["api_key"]:
+                        key_name = "PROVIDER_API_KEY" if provider == "DEFAULT" else f"{provider}_API_KEY"
+                        raise ValueError(f"Set {key_name} in the backend environment")
+                    provider_clients[provider] = AsyncOpenAI(
+                        api_key=provider_config["api_key"],
+                        base_url=provider_config["base_url"],
+                        timeout=httpx.Timeout(timeout=read_timeout, connect=connect_timeout),
+                        max_retries=1,
+                    )
+
+            application.state.mcp_session = session
+            application.state.mcp_tools = openai_tools
+            application.state.mcp_tool_mapping = tool_mapping
+
+            print("MCP tools registered:", list(tool_mapping.keys()))
+            yield
+        finally:
+            if owns_clients:
+                for client in provider_clients.values():
+                    await client.close()
 
 
 app = create_app()
